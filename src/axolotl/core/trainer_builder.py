@@ -8,6 +8,7 @@ import importlib
 import importlib.util
 import logging
 import math
+import os
 import sys
 from abc import abstractmethod
 from collections import defaultdict
@@ -28,9 +29,18 @@ from transformers import (
     TrainerCallback,
     TrainingArguments,
 )
-from transformers.trainer_utils import seed_worker
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, seed_worker
 from transformers.utils import is_sagemaker_mp_enabled
-from trl import DPOConfig, DPOTrainer, KTOConfig, KTOTrainer, ORPOConfig, ORPOTrainer
+from trl import (
+    CPOConfig,
+    CPOTrainer,
+    DPOConfig,
+    DPOTrainer,
+    KTOConfig,
+    KTOTrainer,
+    ORPOConfig,
+    ORPOTrainer,
+)
 from trl.trainer.utils import pad_to_length
 
 from axolotl.loraplus import create_loraplus_optimizer
@@ -226,6 +236,18 @@ class AxolotlTrainingMixins:
         default=None,
         metadata={"help": "whether to use sequential sampling for curriculum learning"},
     )
+    alternate_optimizer: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "workaround to pass an alternate optimizer to the HF trainer"
+        },
+    )
+    alternate_lr_scheduler_type: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "workaround to pass an alternate lr scheduler to the HF trainer"
+        },
+    )
 
 
 @dataclass
@@ -259,58 +281,24 @@ class AxolotlKTOConfig(AxolotlTrainingMixins, KTOConfig):
     """
 
 
-class AxolotlTrainer(Trainer):
+@dataclass
+class AxolotlCPOConfig(AxolotlTrainingMixins, CPOConfig):
     """
-    Extend the base Trainer for axolotl helpers
+    CPO config for CPO training
+    """
+
+    simpo_gamma: Optional[float] = field(
+        default=None,
+        metadata={"help": "simpo gamma parameter"},
+    )
+
+
+class SchedulerMixin(Trainer):
+    """
+    Mixin class for scheduler setup in CausalTrainer.
     """
 
     args = None  # type: AxolotlTrainingArguments
-    tag_names = ["axolotl"]
-
-    def __init__(
-        self,
-        *_args,
-        num_epochs=1,
-        bench_data_collator=None,
-        eval_data_collator=None,
-        **kwargs,
-    ):
-        self.num_epochs = num_epochs
-        self.bench_data_collator = bench_data_collator
-        self.eval_data_collator = eval_data_collator
-        super().__init__(*_args, **kwargs)
-        self.train_data_collator = self.data_collator
-        self._stored_metrics = defaultdict(lambda: defaultdict(list))
-        if self.args.orpo_alpha:
-            self.loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-
-    def create_optimizer(self):
-        if self.args.loraplus_lr_ratio is None:
-            return super().create_optimizer()
-
-        opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
-        if self.optimizer is None:  # pylint: disable=access-member-before-definition
-            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
-                self.args,
-                opt_model,
-            )
-
-            loraplus_lr_ratio = getattr(self.args, "loraplus_lr_ratio", None)
-            loraplus_lr_embedding = getattr(self.args, "loraplus_lr_embedding", None)
-            self.optimizer = create_loraplus_optimizer(  # pylint: disable=attribute-defined-outside-init
-                opt_model,
-                optimizer_cls,
-                optimizer_kwargs,
-                loraplus_lr_ratio,
-                loraplus_lr_embedding,
-            )
-
-        if is_sagemaker_mp_enabled():
-            self.optimizer = smp.DistributedOptimizer(  # pylint: disable=attribute-defined-outside-init
-                self.optimizer
-            )
-
-        return self.optimizer
 
     def create_scheduler(
         self, num_training_steps: int, optimizer: torch.optim.Optimizer = None
@@ -336,7 +324,23 @@ class AxolotlTrainer(Trainer):
         # fmt: off
         if self.lr_scheduler is None:  # type: ignore  # pylint: disable=access-member-before-definition
             # fmt: on
-            if use_cosine_quadratic:
+            if self.args.alternate_lr_scheduler_type == "one_cycle":
+                num_warmup_steps = self.args.get_warmup_steps(num_training_steps)
+                pct_start = num_warmup_steps / num_training_steps
+                extra_lr_kwargs = {}
+                if "pct_start" not in self.args.lr_scheduler_kwargs:
+                    extra_lr_kwargs["pct_start"] = pct_start
+                if "anneal_strategy" not in self.args.lr_scheduler_kwargs:
+                    extra_lr_kwargs["anneal_strategy"] = "cos"
+
+                self.lr_scheduler = OneCycleLR(
+                    optimizer,
+                    max_lr=self.args.learning_rate,
+                    total_steps=num_training_steps,
+                    **extra_lr_kwargs,
+                    **self.args.lr_scheduler_kwargs,
+                )
+            elif use_cosine_quadratic:
                 if use_cosine_min_lr:
                     LOG.warning("Both cosine quadratic warmup and min lr detected. Using quadratic warmup.")
 
@@ -373,6 +377,125 @@ class AxolotlTrainer(Trainer):
                 LOG.warning("axolotl's cosine scheduler with min lr not used (e.g., because of deepspeed).")
 
         return self.lr_scheduler
+
+
+class AxolotlTrainer(SchedulerMixin, Trainer):
+    """
+    Extend the base Trainer for axolotl helpers
+    """
+
+    args = None  # type: AxolotlTrainingArguments
+    tag_names = ["axolotl"]
+
+    def __init__(
+        self,
+        *_args,
+        num_epochs=1,
+        bench_data_collator=None,
+        eval_data_collator=None,
+        **kwargs,
+    ):
+        self.num_epochs = num_epochs
+        self.bench_data_collator = bench_data_collator
+        self.eval_data_collator = eval_data_collator
+        super().__init__(*_args, **kwargs)
+        self.train_data_collator = self.data_collator
+        self._stored_metrics = defaultdict(lambda: defaultdict(list))
+        if self.args.orpo_alpha:
+            self.loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+
+    def _wrap_model(self, model, training=True, dataloader=None):
+        if self.args.torch_compile:
+            torch._dynamo.config.accumulated_cache_size_limit = (  # pylint: disable=protected-access
+                256
+            )
+            model = torch.compile(
+                model,
+                backend=self.args.torch_compile_backend,
+                mode=self.args.torch_compile_mode,
+            )
+        return super()._wrap_model(model, training=training, dataloader=dataloader)
+
+    def create_optimizer(self):
+        if (
+            self.args.loraplus_lr_ratio is None
+            and self.args.alternate_optimizer
+            not in ["optimi_adamw", "ao_adamw_8bit", "ao_adamw_4bit", "ao_adamw_fp8"]
+        ):
+            return super().create_optimizer()
+
+        opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
+        if self.optimizer is None:  # pylint: disable=access-member-before-definition
+            decay_parameters = self.get_decay_parameter_names(opt_model)
+            optimizer_grouped_parameters = [
+                {
+                    "params": [
+                        p
+                        for n, p in opt_model.named_parameters()
+                        if (n in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    "params": [
+                        p
+                        for n, p in opt_model.named_parameters()
+                        if (n not in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": 0.0,
+                },
+            ]
+
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
+                self.args,
+                opt_model,
+            )
+
+            if self.args.loraplus_lr_ratio is not None:
+                loraplus_lr_ratio = getattr(self.args, "loraplus_lr_ratio", None)
+                loraplus_lr_embedding = getattr(
+                    self.args, "loraplus_lr_embedding", None
+                )
+                self.optimizer = create_loraplus_optimizer(  # pylint: disable=attribute-defined-outside-init
+                    opt_model,
+                    optimizer_cls,
+                    optimizer_kwargs,
+                    loraplus_lr_ratio,
+                    loraplus_lr_embedding,
+                )
+            elif self.args.alternate_optimizer == "optimi_adamw":
+                from optimi import AdamW
+
+                self.optimizer = (  # pylint: disable=attribute-defined-outside-init
+                    AdamW(
+                        optimizer_grouped_parameters, foreach=False, **optimizer_kwargs
+                    )
+                )
+            elif self.args.alternate_optimizer == "ao_adamw_4bit":
+                from torchao.prototype.low_bit_optim import AdamW4bit
+
+                self.optimizer = (  # pylint: disable=attribute-defined-outside-init
+                    AdamW4bit(optimizer_grouped_parameters, **optimizer_kwargs)
+                )
+            elif self.args.alternate_optimizer == "ao_adamw_8bit":
+                from torchao.prototype.low_bit_optim import AdamW8bit
+
+                self.optimizer = (  # pylint: disable=attribute-defined-outside-init
+                    AdamW8bit(optimizer_grouped_parameters, **optimizer_kwargs)
+                )
+            elif self.args.alternate_optimizer == "ao_adamw_fp8":
+                from torchao.prototype.low_bit_optim import AdamWFp8
+
+                self.optimizer = (  # pylint: disable=attribute-defined-outside-init
+                    AdamWFp8(optimizer_grouped_parameters, **optimizer_kwargs)
+                )
+
+        if is_sagemaker_mp_enabled():
+            self.optimizer = smp.DistributedOptimizer(  # pylint: disable=attribute-defined-outside-init
+                self.optimizer
+            )
+
+        return self.optimizer
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.args.sample_packing and not self.args.pretraining:
@@ -738,6 +861,14 @@ class AxolotlTrainer(Trainer):
         for key, value in metrics.items():
             self._stored_metrics[train_eval][key].append(value)
 
+    def _save_checkpoint(self, model, trial, metrics=None):
+        # make sure the checkpoint dir exists, since trainer is flakey
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+        os.makedirs(output_dir, exist_ok=True)
+        return super()._save_checkpoint(model, trial, metrics=metrics)
+
 
 class AxolotlMambaTrainer(AxolotlTrainer):
     """
@@ -765,37 +896,6 @@ class AxolotlMambaTrainer(AxolotlTrainer):
         )
 
         return lm_loss
-
-
-class OneCycleLRSchedulerTrainer(AxolotlTrainer):
-    """
-    Trainer subclass that uses the OneCycleLR scheduler
-    """
-
-    tag_names = ["axolotl", "onecycle"]
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.lr_scheduler = None
-
-    def create_scheduler(
-        self,
-        num_training_steps: int,
-        optimizer: Optional[torch.optim.Optimizer] = None,
-    ):
-        optimizer = self.optimizer if optimizer is None else optimizer
-        num_warmup_steps = self.args.get_warmup_steps(num_training_steps)
-        pct_start = num_warmup_steps / num_training_steps
-
-        self.lr_scheduler = OneCycleLR(
-            optimizer,
-            max_lr=self.args.learning_rate,
-            total_steps=num_training_steps,
-            pct_start=pct_start,
-            div_factor=6,
-        )
-
-        return self.lr_scheduler
 
 
 class ReLoRATrainer(AxolotlTrainer):
@@ -837,7 +937,7 @@ class ReLoRATrainer(AxolotlTrainer):
         return self.lr_scheduler
 
 
-class AxolotlDPOTrainer(DPOTrainer):
+class AxolotlDPOTrainer(SchedulerMixin, DPOTrainer):
     """
     Extend the base DPOTrainer for axolotl helpers
     """
@@ -898,7 +998,7 @@ class AxolotlDPOTrainer(DPOTrainer):
         return res
 
 
-class AxolotlORPOTrainer(ORPOTrainer):
+class AxolotlORPOTrainer(SchedulerMixin, ORPOTrainer):
     """
     Extend the base ORPOTrainer for axolotl helpers
     """
@@ -906,12 +1006,20 @@ class AxolotlORPOTrainer(ORPOTrainer):
     tag_names = ["axolotl", "orpo"]
 
 
-class AxolotlKTOTrainer(KTOTrainer):
+class AxolotlKTOTrainer(SchedulerMixin, KTOTrainer):
     """
     Extend the base KTOTrainer for axolotl helpers
     """
 
     tag_names = ["axolotl", "kto"]
+
+
+class AxolotlCPOTrainer(SchedulerMixin, CPOTrainer):
+    """
+    Extend the base CPOTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "cpo"]
 
 
 class TrainerBuilderBase(abc.ABC):
@@ -1073,10 +1181,6 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         return callbacks
 
     def _get_trainer_cls(self):
-        if self.cfg.lr_scheduler == "one_cycle" and (
-            self.cfg.fsdp or self.cfg.adapter == "qlora"
-        ):
-            return OneCycleLRSchedulerTrainer
         if self.cfg.relora_steps:
             return ReLoRATrainer
         if self.cfg.model_config_type == "mamba":
@@ -1126,7 +1230,9 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         if self.cfg.fsdp:
             training_arguments_kwargs["fsdp"] = self.cfg.fsdp
             if self.cfg.fsdp_config:
-                training_arguments_kwargs["fsdp_config"] = dict(self.cfg.fsdp_config)
+                training_arguments_kwargs["fsdp_config"] = {
+                    k.lstrip("fsdp_"): v for k, v in dict(self.cfg.fsdp_config).items()
+                }
 
         if self.cfg.adapter == "qlora":
             training_arguments_kwargs["qlora"] = True
@@ -1235,6 +1341,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                     training_arguments_kwargs[
                         "torch_compile_backend"
                     ] = self.cfg.torch_compile_backend
+                if self.cfg.torch_compile_mode:
+                    training_arguments_kwargs[
+                        "torch_compile_mode"
+                    ] = self.cfg.torch_compile_mode
 
         # DDP Config
         if self.cfg.ddp_timeout:
@@ -1320,12 +1430,15 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         training_arguments_kwargs[
             "loraplus_lr_embedding"
         ] = self.cfg.loraplus_lr_embedding
-        training_arguments_kwargs["lr_scheduler_type"] = (
-            self.cfg.lr_scheduler
-            if self.cfg.lr_scheduler
-            and self.cfg.lr_scheduler not in ("one_cycle", "log_sweep")
-            else "cosine"
-        )
+        if self.cfg.lr_scheduler in ["one_cycle", "log_sweep"]:
+            training_arguments_kwargs["lr_scheduler_type"] = "cosine"
+            training_arguments_kwargs[
+                "alternate_lr_scheduler_type"
+            ] = self.cfg.lr_scheduler
+        else:
+            training_arguments_kwargs["lr_scheduler_type"] = (
+                self.cfg.lr_scheduler if self.cfg.lr_scheduler else "cosine"
+            )
         training_arguments_kwargs["lr_scheduler_kwargs"] = (
             self.cfg.lr_scheduler_kwargs if self.cfg.lr_scheduler_kwargs else {}
         )
@@ -1396,6 +1509,16 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
 
         trainer_kwargs = {}
 
+        if self.cfg.optimizer in [
+            "optimi_adamw",
+            "ao_adamw_4bit",
+            "ao_adamw_8bit",
+            "ao_adamw_fp8",
+        ]:
+            # Set default so transformers doesn't throw
+            training_arguments_kwargs["optim"] = "adamw_hf"
+            training_arguments_kwargs["alternate_optimizer"] = self.cfg.optimizer
+
         if self.cfg.optimizer == "lion_pytorch":
             from lion_pytorch import Lion
 
@@ -1423,6 +1546,11 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             if Path(self.cfg.torchdistx_path).exists():
                 sys.path.append(self.cfg.torchdistx_path)
                 importlib.import_module("torchdistx")
+
+        if self.cfg.accelerator_config:
+            training_arguments_kwargs[
+                "accelerator_config"
+            ] = self.cfg.accelerator_config
 
         training_args = (
             AxolotlTrainingArguments(  # pylint: disable=unexpected-keyword-arg
@@ -1617,16 +1745,27 @@ class HFRLTrainerBuilder(TrainerBuilderBase):
             # default to saving each epoch if not defined
             training_args_kwargs["save_strategy"] = "epoch"
 
+        if self.cfg.rl_beta:
+            training_args_kwargs["beta"] = self.cfg.rl_beta
         if self.cfg.orpo_alpha:
             # trl does some odd mapping of alpha to beta to reuse the beta parameter ???
             training_args_kwargs["beta"] = self.cfg.orpo_alpha
 
+        training_args_kwargs["dataset_num_proc"] = self.cfg.dataset_processes
         training_args_cls = AxolotlDPOConfig
         if self.cfg.rpo_alpha is not None:
             training_args_kwargs["rpo_alpha"] = self.cfg.rpo_alpha
+
+        if self.cfg.rl == "simpo":
+            training_args_cls = AxolotlCPOConfig
+            training_args_kwargs["loss_type"] = "simpo"
+            training_args_kwargs["max_length"] = self.cfg.sequence_len
+            training_args_kwargs["simpo_gamma"] = self.cfg.simpo_gamma
+            if self.cfg.cpo_alpha is not None:
+                training_args_kwargs["cpo_alpha"] = self.cfg.cpo_alpha
+
         if self.cfg.rl == "orpo":
             training_args_cls = AxolotlORPOConfig
-            training_args_kwargs["dataset_num_proc"] = self.cfg.dataset_processes
             training_args_kwargs["max_length"] = self.cfg.sequence_len
             if self.cfg.max_prompt_len:
                 training_args_kwargs["max_prompt_length"] = self.cfg.max_prompt_len
@@ -1634,7 +1773,6 @@ class HFRLTrainerBuilder(TrainerBuilderBase):
         if self.cfg.rl == "kto":
             training_args_cls = AxolotlKTOConfig
 
-            training_args_kwargs["beta"] = self.cfg.rl_beta or 0.1
             training_args_kwargs["desirable_weight"] = (
                 self.cfg.kto_desirable_weight or 1.0
             )
@@ -1680,7 +1818,6 @@ class HFRLTrainerBuilder(TrainerBuilderBase):
             ] = self.cfg.precompute_ref_log_probs
         if self.cfg.rl in ["dpo", "ipo"]:
             trainer_cls = AxolotlDPOTrainer
-            dpo_trainer_kwargs["beta"] = self.cfg.rl_beta or 0.1
             trainer_cls_args = [self.model, self.model_ref]
 
             # these aren't used for the ORPO trainer
@@ -1688,13 +1825,14 @@ class HFRLTrainerBuilder(TrainerBuilderBase):
             dpo_trainer_kwargs["max_target_length"] = None
             dpo_trainer_kwargs["max_prompt_length"] = self.cfg.sequence_len
             dpo_trainer_kwargs["generate_during_eval"] = True
-            if self.cfg.rl == "dpo":
-                dpo_trainer_kwargs["dataset_num_proc"] = self.cfg.dataset_processes
         elif self.cfg.rl == "orpo":
             trainer_cls = AxolotlORPOTrainer
             trainer_cls_args = [self.model]
         elif self.cfg.rl in ["kto"]:
             trainer_cls = AxolotlKTOTrainer
+            trainer_cls_args = [self.model]
+        elif self.cfg.rl in ["simpo"]:
+            trainer_cls = AxolotlCPOTrainer
             trainer_cls_args = [self.model]
         else:
             raise ValueError(f"Unsupported RL: {self.cfg.rl}")
