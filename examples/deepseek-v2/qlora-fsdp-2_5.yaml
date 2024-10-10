@@ -1,21 +1,25 @@
-base_model: NousResearch/Meta-Llama-3.1-8B
+base_model: axolotl-quants/DeepSeek-V2.5-bnb-nf4-bf16
+trust_remote_code: true
+
+load_in_8bit: false
+load_in_4bit: true
+strict: false
+
 
 plugins:
   - axolotl.integrations.liger.LigerPlugin
-liger_rope: true
 liger_rms_norm: true
 liger_swiglu: true
 liger_fused_linear_cross_entropy: true
 
-strict: false
-
-chat_template: llama3
+chat_template: deepseek_v2
 datasets:
   - path: mlabonne/FineTome-100k
     type: chat_template
-    split: train[:20%]
+    split: train
+
 dataset_prepared_path: last_run_prepared
-val_set_size: 0.02
+val_set_size: 0.0
 output_dir: ./outputs/out
 
 sequence_len: 4096
@@ -28,8 +32,14 @@ wandb_watch:
 wandb_name:
 wandb_log_model:
 
-gradient_accumulation_steps: 4
-micro_batch_size: 2
+adapter: qlora
+lora_r: 256
+lora_alpha: 256
+lora_target_linear: true
+peft_use_rslora: true
+
+gradient_accumulation_steps: 1
+micro_batch_size: 8
 num_epochs: 1
 optimizer: adamw_torch
 lr_scheduler: cosine
@@ -57,6 +67,7 @@ saves_per_epoch: 1
 debug:
 deepspeed:
 weight_decay: 0.0
+special_tokens:
 fsdp:
   - full_shard
   - auto_wrap
@@ -67,10 +78,6 @@ fsdp_config:
   fsdp_use_orig_params: false
   fsdp_cpu_ram_efficient_loading: true
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
-  fsdp_transformer_layer_cls_to_wrap: LlamaDecoderLayer
+  fsdp_transformer_layer_cls_to_wrap: DeepseekV2DecoderLayer
   fsdp_state_dict_type: FULL_STATE_DICT
   fsdp_sharding_strategy: FULL_SHARD
-  fsdp_backward_prefetch: BACKWARD_PRE
-special_tokens:
-  pad_token: <|finetune_right_pad_id|>
-  eos_token: <|eot_id|>

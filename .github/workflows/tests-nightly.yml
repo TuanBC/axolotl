@@ -25,6 +25,7 @@ jobs:
       fail-fast: false
       matrix:
         python_version: ["3.10", "3.11"]
+        pytorch_version: ["2.3.1", "2.4.1"]
     timeout-minutes: 20
 
     steps:
@@ -36,6 +37,10 @@ jobs:
         with:
           python-version: ${{ matrix.python_version }}
           cache: 'pip' # caching pip dependencies
+
+      - name: Install PyTorch
+        run: |
+          pip3 install torch==${{ matrix.pytorch_version }} --index-url https://download.pytorch.org/whl/cpu
 
       - name: Update requirements.txt
         run: |
@@ -86,7 +91,7 @@ jobs:
           - cuda: 124
             cuda_version: 12.4.1
             python_version: "3.11"
-            pytorch: 2.4.0
+            pytorch: 2.4.1
             num_gpus: 1
             axolotl_extras:
             nightly_build: "true"
